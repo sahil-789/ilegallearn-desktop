@@ -1,0 +1,14 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["https://ilegallearn.com"]
+  },
+  "permissions": [
+    "core:default",
+    "allow-save-pdf-download",
+    "opener:allow-default-urls"
+  ]
+}

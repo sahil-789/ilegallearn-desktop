@@ -1,0 +1,4 @@
+[[permission]]
+identifier = "allow-save-pdf-download"
+description = "Allows the iLegalLearn production webview to save a generated PDF through the native Save dialog."
+commands.allow = ["save_pdf_download"]
