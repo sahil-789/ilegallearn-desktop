@@ -24,6 +24,14 @@ fn is_system_url(url: &tauri::Url) -> bool {
     matches!(url.scheme(), "http" | "https" | "mailto" | "tel")
 }
 
+fn is_razorpay_embedded_url(url: &tauri::Url) -> bool {
+    url.scheme() == "https"
+        && matches!(
+            url.host_str(),
+            Some("api.razorpay.com" | "checkout.razorpay.com")
+        )
+}
+
 fn desktop_oauth_client_id(url: &tauri::Url) -> Option<String> {
     if url.scheme() != OAUTH_BRIDGE_SCHEME
         || url.host_str() != Some("oauth")
@@ -237,7 +245,10 @@ async fn save_pdf_download(
 ) -> Result<String, String> {
     use base64::engine::general_purpose::STANDARD;
 
-    eprintln!("PDF bridge invoked for {file_name} ({} encoded bytes)", base64_data.len());
+    eprintln!(
+        "PDF bridge invoked for {file_name} ({} encoded bytes)",
+        base64_data.len()
+    );
 
     const MAX_ENCODED_PDF_SIZE: usize = 70 * 1024 * 1024;
     if base64_data.len() > MAX_ENCODED_PDF_SIZE {
@@ -251,7 +262,10 @@ async fn save_pdf_download(
     let mut safe_name: String = requested_name
         .chars()
         .map(|character| {
-            if matches!(character, '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*') {
+            if matches!(
+                character,
+                '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*'
+            ) {
                 '_'
             } else {
                 character
@@ -478,7 +492,11 @@ pub fn run() {
                 }
             })
             .on_new_window(move |url, _features| {
-                open_with_system(new_window_app.clone(), url);
+                if is_razorpay_embedded_url(&url) {
+                    eprintln!("Ignored Razorpay embedded new-window request: {url}");
+                } else {
+                    open_with_system(new_window_app.clone(), url);
+                }
                 NewWindowResponse::Deny
             })
             .build()?;
