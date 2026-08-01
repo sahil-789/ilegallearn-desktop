@@ -24,12 +24,17 @@ fn is_system_url(url: &tauri::Url) -> bool {
     matches!(url.scheme(), "http" | "https" | "mailto" | "tel")
 }
 
-fn is_razorpay_embedded_url(url: &tauri::Url) -> bool {
-    url.scheme() == "https"
-        && matches!(
-            url.host_str(),
-            Some("api.razorpay.com" | "checkout.razorpay.com")
-        )
+fn is_razorpay_url(url: &tauri::Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+
+    url.host_str().is_some_and(|host| {
+        host == "razorpay.com"
+            || host
+                .strip_suffix(".razorpay.com")
+                .is_some_and(|prefix| !prefix.is_empty())
+    })
 }
 
 fn desktop_oauth_client_id(url: &tauri::Url) -> Option<String> {
@@ -481,7 +486,7 @@ pub fn run() {
                 );
             })
             .on_navigation(move |url| {
-                if is_internal_url(url) {
+                if is_internal_url(url) || is_razorpay_url(url) {
                     true
                 } else if let Some(client_id) = desktop_oauth_client_id(url) {
                     run_google_oauth(navigation_app.clone(), client_id);
@@ -492,8 +497,8 @@ pub fn run() {
                 }
             })
             .on_new_window(move |url, _features| {
-                if is_razorpay_embedded_url(&url) {
-                    eprintln!("Ignored Razorpay embedded new-window request: {url}");
+                if is_razorpay_url(&url) {
+                    eprintln!("Blocked Razorpay background new-window request: {url}");
                 } else {
                     open_with_system(new_window_app.clone(), url);
                 }
@@ -505,4 +510,30 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_razorpay_url;
+
+    #[test]
+    fn recognizes_only_https_razorpay_origins() {
+        for value in [
+            "https://razorpay.com/",
+            "https://api.razorpay.com/v1/checkout/public",
+            "https://checkout.razorpay.com/v1/checkout.js",
+            "https://cdn.razorpay.com/static/widget.html",
+        ] {
+            assert!(is_razorpay_url(&value.parse().unwrap()), "{value}");
+        }
+
+        for value in [
+            "http://api.razorpay.com/",
+            "https://evilrazorpay.com/",
+            "https://razorpay.com.example.com/",
+            "https://example.com/",
+        ] {
+            assert!(!is_razorpay_url(&value.parse().unwrap()), "{value}");
+        }
+    }
 }
