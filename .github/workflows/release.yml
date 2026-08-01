@@ -21,15 +21,6 @@ jobs:
           - platform: macos-latest
             build_args: --bundles app,dmg
 
-    env:
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
-      APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
-      APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
-      APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -51,39 +42,108 @@ jobs:
         run: |
           node -e "const fs=require('fs'); const version=JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json','utf8')).version; const tag=process.env.GITHUB_REF_NAME.replace(/^v/,''); if (version !== tag) { console.error('Tag v' + tag + ' does not match tauri.conf.json version ' + version); process.exit(1); }"
 
-      - name: Import Developer ID certificate
-        if: runner.os == 'macOS' && env.APPLE_CERTIFICATE != ''
+      - name: Check whether Apple signing is configured
+        if: runner.os == 'macOS'
+        id: apple-signing
+        env:
+          HAS_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE != '' }}
+          HAS_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
+          HAS_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
+          HAS_KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD != '' }}
+          HAS_API_ISSUER: ${{ secrets.APPLE_API_ISSUER != '' }}
+          HAS_API_KEY: ${{ secrets.APPLE_API_KEY != '' }}
+          HAS_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT != '' }}
         shell: bash
         run: |
-          : "${APPLE_CERTIFICATE_PASSWORD:?APPLE_CERTIFICATE_PASSWORD is required when APPLE_CERTIFICATE is set}"
-          : "${APPLE_SIGNING_IDENTITY:?APPLE_SIGNING_IDENTITY is required when APPLE_CERTIFICATE is set}"
-          : "${KEYCHAIN_PASSWORD:?KEYCHAIN_PASSWORD is required when APPLE_CERTIFICATE is set}"
-          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id.p12"
+          if [[ "$HAS_CERTIFICATE" == "true" \
+             && "$HAS_CERTIFICATE_PASSWORD" == "true" \
+             && "$HAS_SIGNING_IDENTITY" == "true" \
+             && "$HAS_KEYCHAIN_PASSWORD" == "true" \
+             && "$HAS_API_ISSUER" == "true" \
+             && "$HAS_API_KEY" == "true" \
+             && "$HAS_API_KEY_CONTENT" == "true" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "Apple signing secrets are incomplete; building unsigned macOS artifacts."
+          fi
+
+      - name: Import Developer ID Application certificate
+        if: runner.os == 'macOS' && steps.apple-signing.outputs.ready == 'true'
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id-application.p12"
           KEYCHAIN_PATH="$RUNNER_TEMP/ilegallearn-signing.keychain-db"
           printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERTIFICATE_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
       - name: Prepare App Store Connect notarization key
-        if: runner.os == 'macOS' && env.APPLE_API_KEY_CONTENT != ''
+        if: runner.os == 'macOS' && steps.apple-signing.outputs.ready == 'true'
         shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
         run: |
-          : "${APPLE_API_ISSUER:?APPLE_API_ISSUER is required when APPLE_API_KEY_CONTENT is set}"
-          : "${APPLE_API_KEY:?APPLE_API_KEY is required when APPLE_API_KEY_CONTENT is set}"
           API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
           printf '%s' "$APPLE_API_KEY_CONTENT" > "$API_KEY_PATH"
           chmod 600 "$API_KEY_PATH"
           echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
 
-      - name: Build and upload release artifacts
+      - name: Build and upload unsigned Windows artifacts
+        if: runner.os == 'Windows'
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: iLegalLearn ${{ github.ref_name }}
+          releaseBody: Download the installer for your operating system from the assets below.
+          releaseDraft: true
+          prerelease: false
+          generateReleaseNotes: true
+          uploadUpdaterJson: false
+          args: ${{ matrix.build_args }}
+
+      - name: Build and upload unsigned macOS artifacts
+        if: runner.os == 'macOS' && steps.apple-signing.outputs.ready != 'true'
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: iLegalLearn ${{ github.ref_name }}
+          releaseBody: Download the installer for your operating system from the assets below.
+          releaseDraft: true
+          prerelease: false
+          generateReleaseNotes: true
+          uploadUpdaterJson: false
+          args: ${{ matrix.build_args }}
+
+      - name: Build, sign, notarize, and upload macOS artifacts
+        if: runner.os == 'macOS' && steps.apple-signing.outputs.ready == 'true'
+        uses: tauri-apps/tauri-action@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: iLegalLearn ${{ github.ref_name }}
