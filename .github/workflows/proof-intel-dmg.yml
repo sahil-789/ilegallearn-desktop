@@ -1,0 +1,206 @@
+name: Proof Intel macOS DMG packaging
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag to build and attach the Intel proof DMG to
+        required: true
+        default: v0.1.3
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-intel-dmg-proof:
+    name: Build signed Intel DMG proof
+    runs-on: macos-15-intel
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "10.13"
+
+    steps:
+      - name: Check out requested release
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.release_tag }}
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install Rust with Intel target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const version = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).version;
+          const tagVersion = '${{ inputs.release_tag }}'.replace(/^v/, '');
+          if (version !== tagVersion) throw new Error(`Tag version ${tagVersion} does not match app version ${version}`);
+          NODE
+
+      - name: Require complete Apple signing credentials
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY KEYCHAIN_PASSWORD APPLE_API_ISSUER APPLE_API_KEY APPLE_API_KEY_CONTENT; do
+            if [[ -z "${!name}" ]]; then
+              echo "Required signing secret $name is missing or empty." >&2
+              exit 1
+            fi
+          done
+
+      - name: Import Developer ID Application certificate
+        shell: bash
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERTIFICATE_PATH="$RUNNER_TEMP/developer-id-application.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/ilegallearn-intel-proof.keychain-db"
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security import "$CERTIFICATE_PATH" -k "$KEYCHAIN_PATH" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+      - name: Reconstruct App Store Connect API key
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          API_KEY_PATH="$RUNNER_TEMP/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s' "$APPLE_API_KEY_CONTENT" > "$API_KEY_PATH"
+          chmod 600 "$API_KEY_PATH"
+          echo "APPLE_API_KEY_PATH=$API_KEY_PATH" >> "$GITHUB_ENV"
+
+      - name: Build, sign, notarize, and staple Intel app with Tauri
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          npm run tauri -- build \
+            --target x86_64-apple-darwin \
+            --bundles app \
+            --config '{"bundle":{"macOS":{"minimumSystemVersion":"10.13"}}}'
+
+      - name: Verify signed and stapled Intel app
+        id: app
+        shell: bash
+        run: |
+          APP_PATH="src-tauri/target/x86_64-apple-darwin/release/bundle/macos/iLegalLearn.app"
+          BINARY_PATH="$APP_PATH/Contents/MacOS/ilegallearn-desktop"
+          [[ -d "$APP_PATH" && -f "$BINARY_PATH" ]]
+
+          file "$BINARY_PATH"
+          [[ "$(lipo -archs "$BINARY_PATH")" == "x86_64" ]]
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --type execute --verbose=4 "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+
+          LOAD_COMMANDS="$(otool -l "$BINARY_PATH")"
+          printf '%s\n' "$LOAD_COMMANDS"
+          DEPLOYMENT_TARGET="$(printf '%s\n' "$LOAD_COMMANDS" | awk '
+            $2 == "LC_BUILD_VERSION" { build = 1; legacy = 0; next }
+            build && $1 == "minos" { print $2; exit }
+            $2 == "LC_VERSION_MIN_MACOSX" { legacy = 1; build = 0; next }
+            legacy && $1 == "version" { print $2; exit }
+          ')"
+          [[ "$DEPLOYMENT_TARGET" == "10.13" ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP_PATH/Contents/Info.plist")" == "10.13" ]]
+
+          echo "app_path=$APP_PATH" >> "$GITHUB_OUTPUT"
+          echo "deployment_target=$DEPLOYMENT_TARGET" >> "$GITHUB_OUTPUT"
+
+      - name: Package Intel app into DMG with hdiutil
+        id: dmg
+        shell: bash
+        run: |
+          VERSION="${{ inputs.release_tag }}"
+          VERSION="${VERSION#v}"
+          OUTPUT_DIR="$RUNNER_TEMP/ilegallearn-intel-dmg"
+          STAGING_DIR="$RUNNER_TEMP/ilegallearn-intel-dmg-staging"
+          DMG_PATH="$OUTPUT_DIR/iLegalLearn_${VERSION}_macos_intel.dmg"
+
+          rm -rf "$OUTPUT_DIR" "$STAGING_DIR"
+          mkdir -p "$OUTPUT_DIR" "$STAGING_DIR"
+          ditto "${{ steps.app.outputs.app_path }}" "$STAGING_DIR/iLegalLearn.app"
+          ln -s /Applications "$STAGING_DIR/Applications"
+
+          hdiutil create \
+            -volname "iLegalLearn" \
+            -srcfolder "$STAGING_DIR" \
+            -ov \
+            -format UDZO \
+            "$DMG_PATH"
+
+          [[ -f "$DMG_PATH" ]]
+          hdiutil verify "$DMG_PATH"
+          echo "dmg_path=$DMG_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Sign, notarize, staple, and validate Intel DMG
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+        run: |
+          DMG_PATH="${{ steps.dmg.outputs.dmg_path }}"
+          codesign --force --sign "$APPLE_SIGNING_IDENTITY" --timestamp "$DMG_PATH"
+          codesign --verify --verbose=2 "$DMG_PATH"
+
+          xcrun notarytool submit "$DMG_PATH" \
+            --key "$APPLE_API_KEY_PATH" \
+            --key-id "$APPLE_API_KEY" \
+            --issuer "$APPLE_API_ISSUER" \
+            --wait
+
+          xcrun stapler staple "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
+          codesign --verify --verbose=2 "$DMG_PATH"
+          hdiutil verify "$DMG_PATH"
+
+      - name: Upload fully verified Intel DMG as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: iLegalLearn-${{ inputs.release_tag }}-macos-intel-proof
+          path: ${{ steps.dmg.outputs.dmg_path }}
+          if-no-files-found: error
+
+      - name: Attach fully verified Intel DMG to existing GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${{ inputs.release_tag }}"
+          gh release upload "${{ inputs.release_tag }}" "${{ steps.dmg.outputs.dmg_path }}" --clobber
+
+      - name: Proof result
+        shell: bash
+        run: |
+          echo "Intel DMG proof completed for x86_64 with deployment target ${{ steps.app.outputs.deployment_target }}."
+          echo "Runtime compatibility with macOS 10.13.6 remains unverified pending physical-machine testing."
